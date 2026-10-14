@@ -1,0 +1,8 @@
+[package]
+name = "comic-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+natord = "1.0.9"
+zip = "9.0.3"

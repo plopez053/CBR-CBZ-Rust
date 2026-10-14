@@ -1,0 +1,7 @@
+[package]
+name = "comic-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+comic-core = { path = "../comic-core" }
