@@ -1,2 +1,6 @@
 # Carpeta de compilación de Cargo
 /target
+
+# Cómics de prueba personales en la raíz (los de tests/fixtures sí se suben)
+/*.cbz
+/*.cbr

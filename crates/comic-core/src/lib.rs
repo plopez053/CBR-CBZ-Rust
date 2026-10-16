@@ -18,28 +18,72 @@ pub fn es_imagen(nombre: &str) -> bool {
         .any(|ext| minusculas.ends_with(&format!(".{ext}")))
 }
 
-/// Abre un `.cbz` y devuelve los nombres de sus páginas (solo imágenes).
-///
-/// Las páginas salen en orden natural: `2.jpg` va antes que `10.jpg`.
-pub fn listar_paginas(ruta: &str) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(ruta).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+/// Un `.cbz` abierto: el zip se abre una vez y se queda abierto mientras se lee.
+pub struct Cbz {
+    archive: zip::ZipArchive<std::fs::File>,
+    paginas: Vec<String>,
+}
 
-    let mut paginas = Vec::new();
+impl Cbz {
+    /// Abre el archivo y prepara la lista de páginas en orden natural
+    /// (`2.jpg` va antes que `10.jpg`).
+    pub fn abrir(ruta: &str) -> Result<Cbz, String> {
+        let file = std::fs::File::open(ruta).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
-    for i in 0..archive.len() {
-        let entrada = archive.by_index(i).map_err(|e| e.to_string())?;
+        let mut paginas = Vec::new();
 
-        let nombre = entrada.name().map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let entrada = archive.by_index(i).map_err(|e| e.to_string())?;
+            let nombre = entrada.name().map_err(|e| e.to_string())?;
 
-        if !entrada.is_dir() && es_imagen(&nombre) {
-            paginas.push(nombre.to_string());
+            if !entrada.is_dir() && es_imagen(&nombre) {
+                paginas.push(nombre.to_string());
+            }
         }
+
+        paginas.sort_by(|a, b| natord::compare(a, b));
+
+        Ok(Cbz { archive, paginas })
     }
 
-    paginas.sort_by(|a, b| natord::compare(a, b));
+    /// Nombres de las páginas, ya ordenados.
+    pub fn paginas(&self) -> &[String] {
+        &self.paginas
+    }
 
-    Ok(paginas)
+    /// Bytes (sin decodificar) de la página en la posición `indice`.
+    pub fn leer(&mut self, indice: usize) -> Result<Vec<u8>, String> {
+        let nombre = self
+            .paginas
+            .get(indice)
+            .ok_or(format!("No existe la página {indice}"))?;
+
+        let mut entrada = self.archive.by_name(nombre).map_err(|e| e.to_string())?;
+
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entrada, &mut bytes).map_err(|e| e.to_string())?;
+
+        Ok(bytes)
+    }
+}
+
+/// Abre un `.cbz` y devuelve los nombres de sus páginas (solo imágenes), en orden natural.
+pub fn listar_paginas(ruta: &str) -> Result<Vec<String>, String> {
+    Ok(Cbz::abrir(ruta)?.paginas)
+}
+
+/// Devuelve los bytes de una página concreta de un `.cbz`, buscándola por nombre.
+pub fn leer_pagina(ruta: &str, nombre: &str) -> Result<Vec<u8>, String> {
+    let mut cbz = Cbz::abrir(ruta)?;
+
+    let indice = cbz
+        .paginas()
+        .iter()
+        .position(|p| p == nombre)
+        .ok_or(format!("No existe la página {nombre}"))?;
+
+    cbz.leer(indice)
 }
 
 #[cfg(test)]

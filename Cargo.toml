@@ -6,3 +6,8 @@ members = ["crates/comic-core", "crates/comic-app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# En desarrollo, nuestro código compila rápido sin optimizar, pero las dependencias
+# (decodificar JPG, descomprimir zip) se optimizan: sin esto van decenas de veces más lentas.
+[profile.dev.package."*"]
+opt-level = 3

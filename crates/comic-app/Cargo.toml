@@ -5,3 +5,6 @@ edition.workspace = true
 
 [dependencies]
 comic-core = { path = "../comic-core" }
+eframe = "0.36.2"
+# Solo los formatos que aparecen en cómics; así compila más rápido.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
