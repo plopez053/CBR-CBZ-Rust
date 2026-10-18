@@ -5,4 +5,13 @@ edition.workspace = true
 
 [dependencies]
 natord = "1.0.9"
+quick-xml = "0.42.0"
+regex = "1.13.1"
+# CB7. Solo descomprimir: sin el compresor ni el cifrado compila menos.
+sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }
+# CBT.
+tar = "0.4.46"
+# CBR. Compila la librería oficial de RARLAB (C++): es la única que lee bien RAR5.
+unrar = "0.5.8"
+# CBZ.
 zip = "9.0.3"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/comic-core", "crates/comic-app"]
+members = ["crates/comic-core", "crates/comic-imagen", "crates/comic-biblioteca", "crates/comic-app"]
 
 # Valores compartidos: cada crate los hereda con `version.workspace = true`, etc.
 [workspace.package]
@@ -10,4 +10,11 @@ edition = "2021"
 # En desarrollo, nuestro código compila rápido sin optimizar, pero las dependencias
 # (decodificar JPG, descomprimir zip) se optimizan: sin esto van decenas de veces más lentas.
 [profile.dev.package."*"]
+opt-level = 3
+
+# Decodificar y encoger páginas también tiene que ir rápido mientras desarrollamos, pero
+# eso no basta con optimizar `fast_image_resize`: su código genérico se compila en el
+# crate que lo llama. Por eso todo ese trabajo vive en `comic-imagen` y se optimiza solo
+# ese crate (sin esto, encoger una página tarda ~2 s en vez de ~30 ms).
+[profile.dev.package.comic-imagen]
 opt-level = 3

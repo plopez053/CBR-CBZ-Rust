@@ -1,15 +1,16 @@
 //! Hilos en segundo plano que leen, decodifican y encogen páginas sin congelar la ventana.
 
 use std::ops::RangeInclusive;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use comic_core::Cbz;
+use comic_core::Comic;
+use comic_imagen::Encogedor;
 use eframe::egui;
-use fast_image_resize as fr;
 
 /// Cuántas páginas preparamos por detrás y por delante de la actual.
 pub const ATRAS: usize = 1;
@@ -99,10 +100,10 @@ pub struct Precargador {
 }
 
 impl Precargador {
-    /// Arranca `hilos` trabajadores. El primero se queda con el `Cbz` ya abierto;
-    /// el resto abre el suyo desde `ruta`, porque leer del zip necesita `&mut` y
+    /// Arranca `hilos` trabajadores. El primero se queda con el `Comic` ya abierto;
+    /// el resto abre el suyo desde `ruta`, porque leer del archivo necesita `&mut` y
     /// así cada hilo lee a su ritmo sin esperar a los demás.
-    pub fn nuevo(cbz: Cbz, ruta: &str, hilos: usize, ctx: egui::Context) -> Precargador {
+    pub fn nuevo(comic: Comic, ruta: &Path, hilos: usize, ctx: egui::Context) -> Precargador {
         let (enviar_peticion, recibir_peticion) = mpsc::channel::<Peticion>();
         let (enviar_resultado, recibir_resultado) = mpsc::channel::<Respuesta>();
         let estado = Arc::new(Estado::default());
@@ -111,19 +112,19 @@ impl Precargador {
         // y cada petición la coge el primero que esté libre.
         let recibir_peticion = Arc::new(Mutex::new(recibir_peticion));
 
-        let mut primero = Some(cbz);
+        let mut primero = Some(comic);
         for _ in 0..hilos.max(1) {
-            let cbz = match primero.take() {
-                Some(cbz) => cbz,
-                None => match Cbz::abrir(ruta) {
-                    Ok(cbz) => cbz,
+            let comic = match primero.take() {
+                Some(comic) => comic,
+                None => match Comic::abrir(ruta) {
+                    Ok(comic) => comic,
                     // Si no se puede reabrir, nos apañamos con los hilos que ya hay.
                     Err(_) => break,
                 },
             };
 
             let trabajador = Trabajador {
-                cbz,
+                comic,
                 peticiones: Arc::clone(&recibir_peticion),
                 resultados: enviar_resultado.clone(),
                 estado: Arc::clone(&estado),
@@ -158,7 +159,7 @@ impl Precargador {
 
 /// Lo que necesita cada hilo para trabajar por su cuenta.
 struct Trabajador {
-    cbz: Cbz,
+    comic: Comic,
     peticiones: Arc<Mutex<Receiver<Peticion>>>,
     resultados: Sender<Respuesta>,
     estado: Arc<Estado>,
@@ -168,10 +169,10 @@ struct Trabajador {
 impl Trabajador {
     /// Bucle del hilo. Termina cuando la ventana se cierra y se suelta el `Sender`.
     fn trabajar(mut self) {
-        let total = self.cbz.paginas().len();
+        let total = self.comic.paginas().len();
         let id_hilo = thread::current().id();
-        // Guarda búferes internos entre páginas: reutilizarlo evita reservar memoria cada vez.
-        let mut redimensionador = fr::Resizer::new();
+        // Uno por hilo, para todas sus páginas: así reutiliza sus búferes.
+        let mut encogedor = Encogedor::default();
 
         loop {
             // El candado se suelta al acabar esta línea: mientras decodificamos,
@@ -196,7 +197,7 @@ impl Trabajador {
                 eprintln!("[{id_hilo:?}] Página {indice} descartada ({motivo})");
                 Respuesta::Descartada(indice, caja)
             } else {
-                match self.preparar(indice, caja, &mut redimensionador) {
+                match self.preparar(indice, caja, &mut encogedor) {
                     Ok((original, imagen)) => Respuesta::Lista(Pagina {
                         indice,
                         caja,
@@ -225,41 +226,17 @@ impl Trabajador {
         &mut self,
         indice: usize,
         caja: Tamano,
-        redimensionador: &mut fr::Resizer,
+        encogedor: &mut Encogedor,
     ) -> Result<(Tamano, egui::ColorImage), String> {
         let inicio = Instant::now();
-        let bytes = self.cbz.leer(indice)?;
-        let original = image::load_from_memory(&bytes)
-            .map_err(|e| e.to_string())?
-            .to_rgba8();
+        let bytes = self.comic.leer(indice)?;
+        let original = comic_imagen::decodificar(&bytes)?;
         let decodificada = inicio.elapsed();
 
-        let (ancho, alto) = original.dimensions();
+        let (ancho, alto) = (original.ancho, original.alto);
         let [destino_ancho, destino_alto] = tamano_textura([ancho, alto], caja);
-
-        let pixeles = if [destino_ancho, destino_alto] == [ancho, alto] {
-            // Se va a ver a su tamaño o más grande: la subimos tal cual.
-            original.into_raw()
-        } else {
-            let origen = fr::images::Image::from_vec_u8(
-                ancho,
-                alto,
-                original.into_raw(),
-                fr::PixelType::U8x4,
-            )
-            .map_err(|e| e.to_string())?;
-            let mut destino =
-                fr::images::Image::new(destino_ancho, destino_alto, fr::PixelType::U8x4);
-            // Lanczos3 directamente sobre sRGB. Comparado con Mitchell, Magic Kernel Sharp y
-            // con encoger en luz lineal, es lo que mejor conserva el trazo de la tinta y las
-            // letras: en luz lineal las líneas finas salen más grises y delgadas.
-            let opciones = fr::ResizeOptions::new()
-                .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
-            redimensionador
-                .resize(&origen, &mut destino, &opciones)
-                .map_err(|e| e.to_string())?;
-            destino.into_vec()
-        };
+        // Si se va a ver a su tamaño o más grande, sale tal cual.
+        let encogida = encogedor.encoger(original, destino_ancho, destino_alto)?;
 
         eprintln!(
             "[{:?}] Página {indice} lista: {ancho}x{alto} -> {destino_ancho}x{destino_alto} \
@@ -270,7 +247,7 @@ impl Trabajador {
         );
 
         let tamano = [destino_ancho as usize, destino_alto as usize];
-        let imagen = egui::ColorImage::from_rgba_unmultiplied(tamano, &pixeles);
+        let imagen = egui::ColorImage::from_rgba_unmultiplied(tamano, &encogida.rgba);
         Ok(([ancho, alto], imagen))
     }
 }
