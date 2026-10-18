@@ -6,5 +6,7 @@ edition.workspace = true
 [dependencies]
 comic-core = { path = "../comic-core" }
 eframe = "0.36.2"
+# Encoge las páginas con Lanczos3 usando SIMD: mucho más rápido que el `resize` de `image`.
+fast_image_resize = "6.1.0"
 # Solo los formatos que aparecen en cómics; así compila más rápido.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
