@@ -80,13 +80,12 @@ impl Aplicacion {
         // ella comparte el progreso, y uno que no esté lo recuerda igualmente.
         let huella = comic_biblioteca::huella(ruta, comic.paginas());
         // Si se terminó, se vuelve a empezar desde el principio.
-        let pagina = match &self.biblioteca {
-            Ok(vista) => vista
-                .progreso(&huella)
-                .filter(|p| !p.terminado)
-                .map_or(0, |p| p.pagina),
-            Err(_) => 0,
+        let previo = match &self.biblioteca {
+            Ok(vista) => vista.progreso(&huella),
+            Err(_) => None,
         };
+        let ya_leido = previo.is_some_and(|p| p.terminado);
+        let pagina = previo.filter(|p| !p.terminado).map_or(0, |p| p.pagina);
 
         let titulo = ruta
             .file_stem()
@@ -112,7 +111,9 @@ impl Aplicacion {
             lector,
             huella,
             siguiente: siguiente.map(|(ruta, _)| ruta),
-            guardada: None,
+            // Abrir por error un cómic ya leído no debe dejarlo como no leído: hasta que no
+            // se pase de página, no se guarda nada.
+            guardada: ya_leido.then_some(pagina),
         });
     }
 

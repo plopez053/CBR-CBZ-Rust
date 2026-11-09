@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use comic_biblioteca::{
-    Biblioteca, Carpeta, Ficha, Movimiento, Portada, Progreso, Resumen, Serie,
+    Biblioteca, Carpeta, Ficha, Informe, Movimiento, Portada, Progreso, Resumen, Serie,
 };
 use eframe::egui::{self, Color32, FontId, Rect, Stroke, StrokeKind};
 
@@ -234,6 +234,10 @@ pub struct VistaBiblioteca {
     icono: Option<(f32, egui::TextureHandle)>,
 
     escaneo: Option<Escaneo>,
+    /// Una búsqueda de cómics movidos en marcha en otro hilo.
+    reubicando: Option<Receiver<Result<Informe, String>>>,
+    /// Lo que resultó de la última búsqueda de cómics movidos.
+    aviso_carpetas: Option<String>,
     /// Ha cambiado algo durante un escaneo (una carpeta nueva): hay que repetirlo al acabar.
     reescanear: bool,
     ultima_recarga: Instant,
@@ -307,6 +311,8 @@ impl VistaBiblioteca {
             fotograma: 0,
             icono: None,
             escaneo: None,
+            reubicando: None,
+            aviso_carpetas: None,
             reescanear: false,
             ultima_recarga: Instant::now(),
             arriba: false,
@@ -448,6 +454,67 @@ impl VistaBiblioteca {
                 }
                 ctx.request_repaint_after(RECARGA_DURANTE_ESCANEO);
             }
+        }
+    }
+
+    /// Busca en `raiz` los cómics que se han movido de sitio y corrige sus rutas, en otro
+    /// hilo y con su propia conexión a la base de datos. Solo se mira dentro de `raiz`.
+    fn reubicar_automaticamente(&mut self, ctx: &egui::Context, raiz: PathBuf) {
+        if self.reubicando.is_some() || self.escaneo.is_some() {
+            return;
+        }
+        let (enviar, recibir) = mpsc::channel();
+        let ruta_db = self.ruta_db.clone();
+        let ctx = ctx.clone();
+        eprintln!("[biblioteca] Buscando cómics movidos en {}", raiz.display());
+        thread::spawn(move || {
+            let resultado = Biblioteca::abrir(&ruta_db)
+                .and_then(|biblioteca| biblioteca.reubicar_automaticamente(&[raiz]));
+            let _ = enviar.send(resultado);
+            ctx.request_repaint();
+        });
+        self.reubicando = Some(recibir);
+        self.aviso_carpetas = None;
+    }
+
+    /// Recoge el resultado de la búsqueda de cómics movidos, si ya ha terminado.
+    fn seguir_reubicacion(&mut self, ctx: &egui::Context) {
+        let Some(recibir) = &self.reubicando else {
+            return;
+        };
+        match recibir.try_recv() {
+            Ok(resultado) => {
+                self.reubicando = None;
+                match resultado {
+                    Ok(informe) => {
+                        eprintln!("[biblioteca] Búsqueda terminada: {informe:?}");
+                        self.aviso_carpetas = Some(texto_de_informe(informe));
+                        self.recargar();
+                        if informe.carpetas + informe.archivos > 0 {
+                            self.escanear(ctx);
+                        }
+                    }
+                    Err(e) => self.mostrar_error(format!("No se pudo buscar los cómics: {e}")),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.reubicando = None,
+        }
+    }
+
+    /// Apunta una carpeta de la biblioteca a su nuevo sitio.
+    fn reubicar_carpeta(&mut self, ctx: &egui::Context, id: i64, nueva: &Path) {
+        match self.biblioteca.reubicar_carpeta(id, nueva) {
+            Ok(()) => {
+                eprintln!("[biblioteca] Carpeta reubicada en {}", nueva.display());
+                self.aviso_carpetas = None;
+                self.serie = None;
+                self.recargar();
+                self.escanear(ctx);
+            }
+            Err(e) => self.mostrar_error(e),
         }
     }
 
@@ -727,6 +794,20 @@ impl VistaBiblioteca {
                     self.pedir_dialogo_de_serie(Dialogo::CarpetasParaSerie, clave);
                     ui.close();
                 }
+                let leida = self
+                    .series
+                    .iter()
+                    .find(|s| &s.clave == clave)
+                    .is_some_and(|s| s.comics > 0 && s.terminados == s.comics);
+                let texto = if leida {
+                    "Marcar como no leída"
+                } else {
+                    "Marcar como leída"
+                };
+                if ui.button(texto).clicked() {
+                    self.marcar_serie_leida(clave, !leida);
+                    ui.close();
+                }
                 if self.biblioteca.tiene_orden_manual(clave).unwrap_or(false)
                     && ui.button("Restablecer orden").clicked()
                 {
@@ -735,6 +816,21 @@ impl VistaBiblioteca {
                 }
             }
             if let Renombrable::Comic(huella) = &objetivo {
+                let leido = self
+                    .biblioteca
+                    .progreso(huella)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.terminado);
+                let texto = if leido {
+                    "Marcar como no leído"
+                } else {
+                    "Marcar como leído"
+                };
+                if ui.button(texto).clicked() {
+                    self.marcar_leido(huella, !leido);
+                    ui.close();
+                }
                 // Apartado del resto, para no darle sin querer.
                 ui.separator();
                 if ui.button("Eliminar").clicked() {
@@ -745,6 +841,20 @@ impl VistaBiblioteca {
 
             estilo::cerrar_menu_al_alejarse(ui, zona_submenu);
         });
+    }
+
+    fn marcar_leido(&mut self, huella: &str, leido: bool) {
+        match self.biblioteca.marcar_leido(huella, leido) {
+            Ok(()) => self.recargar(),
+            Err(e) => self.mostrar_error(format!("No se pudo cambiar el estado: {e}")),
+        }
+    }
+
+    fn marcar_serie_leida(&mut self, clave: &str, leido: bool) {
+        match self.biblioteca.marcar_serie_leida(clave, leido) {
+            Ok(_) => self.recargar(),
+            Err(e) => self.mostrar_error(format!("No se pudo cambiar el estado: {e}")),
+        }
     }
 
     /// Pide un diálogo para elegir cómics o carpetas que van a la serie `clave`.
@@ -804,6 +914,7 @@ impl VistaBiblioteca {
         let ctx = ui.ctx().clone();
         self.fotograma += 1;
         self.seguir_escaneo(&ctx);
+        self.seguir_reubicacion(&ctx);
         self.novedades.seguir(&ctx, &self.biblioteca);
         self.recibir_miniaturas(&ctx);
         let leyendo = self.seguir_leyendo.first().map(Ficha::portada);
@@ -979,6 +1090,18 @@ impl VistaBiblioteca {
             Dialogo::ComicsParaSerie | Dialogo::CarpetasParaSerie => {
                 if let Some(clave) = self.serie_de_dialogo.take() {
                     self.anadir_a_serie(ctx, &clave, &elegidos);
+                }
+                None
+            }
+            Dialogo::DondeBuscar => {
+                if let Some(raiz) = elegidos.into_iter().next() {
+                    self.reubicar_automaticamente(ctx, raiz);
+                }
+                None
+            }
+            Dialogo::NuevaUbicacion(id) => {
+                if let Some(nueva) = elegidos.first() {
+                    self.reubicar_carpeta(ctx, id, nueva);
                 }
                 None
             }
@@ -1271,6 +1394,13 @@ impl VistaBiblioteca {
 
     fn pagina_carpetas(&mut self, ui: &mut egui::Ui, c: Colores) {
         let escaneando = self.escaneo.is_some();
+        let reubicando = self.reubicando.is_some();
+        let hay_perdidas = self
+            .carpetas
+            .iter()
+            .any(|c| c.perdida || c.archivos_perdidos > 0);
+        let mut buscar_movidos = false;
+        let mut reubicar = None;
         let mut quitar = None;
         let mut reescanear = false;
         let mut anadir_a = None;
@@ -1292,6 +1422,60 @@ impl VistaBiblioteca {
                     );
                     ui.add_space(18.0);
 
+                    if hay_perdidas || reubicando || self.aviso_carpetas.is_some() {
+                        panel(c).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if hay_perdidas {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Algunos cómics ya no están donde la biblioteca los \
+                                         guardó, quizá porque has movido sus carpetas.",
+                                    )
+                                    .color(c.texto),
+                                );
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let boton = ui
+                                        .add_enabled(
+                                            !escaneando && !reubicando,
+                                            boton_subrayado(c, "Buscar automáticamente…"),
+                                        )
+                                        .on_hover_text(
+                                            "Eliges una carpeta y se busca solo dentro de \
+                                             ella, y de sus subcarpetas. Cada cómic se \
+                                             reconoce por su contenido, aunque haya cambiado \
+                                             de nombre; tus archivos no se tocan.",
+                                        )
+                                        .on_disabled_hover_text("Espera a que termine");
+                                    if boton.clicked() {
+                                        buscar_movidos = true;
+                                    }
+                                    if reubicando {
+                                        ui.spinner();
+                                        ui.label(
+                                            egui::RichText::new("Buscando…")
+                                                .color(c.texto_secundario),
+                                        );
+                                    }
+                                });
+                            } else if reubicando {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(
+                                        egui::RichText::new("Buscando…").color(c.texto_secundario),
+                                    );
+                                });
+                            }
+                            if let Some(aviso) = &self.aviso_carpetas {
+                                if hay_perdidas {
+                                    ui.add_space(8.0);
+                                }
+                                ui.label(egui::RichText::new(aviso).color(c.texto_secundario));
+                            }
+                        });
+                        ui.add_space(12.0);
+                    }
+
                     if self.carpetas.is_empty() {
                         ui.label(
                             egui::RichText::new("Todavía no hay ninguna.")
@@ -1305,7 +1489,11 @@ impl VistaBiblioteca {
                                 // La ruta se recorta con "…" para no pisar los botones;
                                 // entera, al pasar el ratón.
                                 let ruta = carpeta.ruta.display().to_string();
-                                let botones = if carpeta.propia { 330.0 } else { 90.0 };
+                                let botones = match (carpeta.propia, carpeta.perdida) {
+                                    (true, _) => 330.0,
+                                    (false, true) => 200.0,
+                                    (false, false) => 90.0,
+                                };
                                 let ancho = (ui.available_width() - botones).max(60.0);
                                 ui.scope(|ui| {
                                     ui.set_max_width(ancho);
@@ -1331,6 +1519,21 @@ impl VistaBiblioteca {
                                         if boton.clicked() {
                                             quitar = Some(carpeta.id);
                                         }
+                                        if carpeta.perdida {
+                                            let boton = ui
+                                                .add_enabled(
+                                                    !escaneando && !reubicando,
+                                                    boton_texto(c, "Reubicar…"),
+                                                )
+                                                .on_hover_text(
+                                                    "Elige dónde está ahora esta carpeta. Los \
+                                                     cómics conservan su progreso.",
+                                                )
+                                                .on_disabled_hover_text("Espera a que termine");
+                                            if boton.clicked() {
+                                                reubicar = Some(carpeta.id);
+                                            }
+                                        }
                                         if carpeta.propia {
                                             if ui.add(boton_texto(c, "Añadir cómics…")).clicked()
                                             {
@@ -1350,6 +1553,22 @@ impl VistaBiblioteca {
                                     },
                                 );
                             });
+                            let aviso = if carpeta.perdida {
+                                Some("No se encuentra en el disco.".to_string())
+                            } else if carpeta.archivos_perdidos > 0 {
+                                let n = carpeta.archivos_perdidos;
+                                Some(format!(
+                                    "{n} {} no se {} en el disco.",
+                                    plural(n, "cómic", "cómics"),
+                                    plural(n, "encuentra", "encuentran"),
+                                ))
+                            } else {
+                                None
+                            };
+                            if let Some(aviso) = aviso {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(aviso).color(c.acento));
+                            }
                         });
                         ui.add_space(6.0);
                     }
@@ -1363,7 +1582,10 @@ impl VistaBiblioteca {
                             self.nueva_carpeta.get_or_insert_with(String::new);
                         }
                         let boton = ui
-                            .add_enabled(!escaneando, boton_texto(c, "Volver a escanear"))
+                            .add_enabled(
+                                !escaneando && !reubicando,
+                                boton_texto(c, "Volver a escanear"),
+                            )
                             .on_hover_text("Buscar cómics nuevos, cambiados o borrados");
                         if boton.clicked() {
                             reescanear = true;
@@ -1432,6 +1654,12 @@ impl VistaBiblioteca {
 
         if let Some(id) = quitar {
             self.quitar_carpeta(id);
+        }
+        if buscar_movidos {
+            self.dialogo_pedido = Some(Dialogo::DondeBuscar);
+        }
+        if let Some(id) = reubicar {
+            self.dialogo_pedido = Some(Dialogo::NuevaUbicacion(id));
         }
         if let Some(id) = anadir_a {
             self.dialogo_pedido = Some(Dialogo::ComicsParaCarpeta(id));
@@ -1713,8 +1941,7 @@ impl VistaBiblioteca {
                     }
                 }
                 None => {
-                    self.posiciones
-                        .insert(clave.to_string(), (meta, fotograma));
+                    self.posiciones.insert(clave.to_string(), (meta, fotograma));
                     (meta, false)
                 }
             };
@@ -1743,7 +1970,8 @@ impl VistaBiblioteca {
 
         for (indice, rect, id, elevacion, clave) in levantadas {
             let tarjeta = &tarjetas[indice];
-            let capa = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(("levantada", &clave)));
+            let capa =
+                egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(("levantada", &clave)));
             let hueco = Rect::from_min_size(rect.min, egui::vec2(ANCHO_TARJETA, ALTO_PORTADA));
             // Sin ocupar sitio en la cuadrícula ni recortar con el área de desplazamiento.
             let mut hijo = ui.new_child(egui::UiBuilder::new().layer_id(capa).max_rect(rect));
@@ -1787,7 +2015,10 @@ impl VistaBiblioteca {
         if arrastre.destino == arrastre.actual {
             return None;
         }
-        Some((huella, huella_de_tarjeta(&tarjetas[arrastre.destino])?.to_string()))
+        Some((
+            huella,
+            huella_de_tarjeta(&tarjetas[arrastre.destino])?.to_string(),
+        ))
     }
 
     /// Termina un arrastre: `huella` pasa al sitio que ocupa `ocupante` en la serie abierta.
@@ -2406,6 +2637,37 @@ impl VistaBiblioteca {
             self.error = None;
         }
     }
+}
+
+/// Lo que se cuenta al usuario cuando acaba la búsqueda de cómics movidos.
+fn texto_de_informe(informe: Informe) -> String {
+    let arreglados = informe.carpetas + informe.archivos;
+    if arreglados == 0 {
+        return "No se ha encontrado ninguno en esa carpeta. Prueba con otra, o con una más \
+                grande que la contenga."
+            .to_string();
+    }
+    let mut partes = Vec::new();
+    if informe.carpetas > 0 {
+        let n = informe.carpetas;
+        partes.push(format!("{n} {}", plural(n, "carpeta", "carpetas")));
+    }
+    if informe.archivos > 0 {
+        let n = informe.archivos;
+        partes.push(format!(
+            "{n} {}",
+            plural(n, "cómic suelto", "cómics sueltos")
+        ));
+    }
+    let mut texto = format!("Reubicado: {}.", partes.join(" y "));
+    if informe.sin_encontrar > 0 {
+        let n = informe.sin_encontrar;
+        texto.push_str(&format!(
+            " {n} {} sin encontrar.",
+            plural(n, "cómic", "cómics")
+        ));
+    }
+    texto
 }
 
 /// Miniaturas que faltan: primero las que se ven y luego las que están a punto de verse.

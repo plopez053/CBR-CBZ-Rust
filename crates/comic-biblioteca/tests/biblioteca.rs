@@ -1090,7 +1090,11 @@ fn un_subtitulo_tras_el_nombre_no_parte_la_serie() {
     // Otra serie de la misma carpeta, que no tiene que mezclarse.
     crear_cbz(&comics.join("Batman Beyond 001.cbz"), 2, None);
     // Y otra carpeta con un nombre parecido, que tampoco.
-    crear_cbz(&comics.join("Otra/Las Crónicas de Wormwood - Aparte.cbz"), 2, None);
+    crear_cbz(
+        &comics.join("Otra/Las Crónicas de Wormwood - Aparte.cbz"),
+        2,
+        None,
+    );
 
     let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
     biblioteca.agregar_carpeta(&comics).unwrap();
@@ -1176,7 +1180,11 @@ fn los_comics_se_pueden_ordenar_a_mano_dentro_de_la_serie() {
         .collect();
     assert_eq!(
         numeros,
-        [Some("1".to_string()), Some("2".to_string()), Some("10".to_string())]
+        [
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("10".to_string())
+        ]
     );
 }
 
@@ -1207,6 +1215,191 @@ fn soltar_un_comic_sobre_otro_ocupa_su_sitio() {
     // Sobre sí mismo o sobre algo que no está: no cambia nada.
     p.biblioteca.restablecer_orden("saga").unwrap();
     p.biblioteca.colocar_en_lugar_de("saga", &a, &a).unwrap();
-    p.biblioteca.colocar_en_lugar_de("saga", &a, "no existe").unwrap();
+    p.biblioteca
+        .colocar_en_lugar_de("saga", &a, "no existe")
+        .unwrap();
     assert!(!p.biblioteca.tiene_orden_manual("saga").unwrap());
+}
+
+// ---- Reubicar cómics que se han movido ----
+
+#[test]
+fn una_carpeta_movida_entera_se_reencuentra() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("Saga").unwrap().remove(0);
+    p.biblioteca
+        .guardar_progreso(&saga.huella, 1, false)
+        .unwrap();
+    assert!(!p.biblioteca.carpetas().unwrap()[0].perdida);
+
+    // El usuario mueve la carpeta a otro sitio.
+    let destino = p._temporal.path().join("Escritorio/lectura");
+    fs::create_dir_all(destino.parent().unwrap()).unwrap();
+    fs::rename(&p.comics, &destino).unwrap();
+    assert!(p.biblioteca.carpetas().unwrap()[0].perdida);
+
+    let informe = p
+        .biblioteca
+        .reubicar_automaticamente(&[p._temporal.path().join("Escritorio")])
+        .unwrap();
+    assert_eq!((informe.carpetas, informe.sin_encontrar), (1, 0));
+    assert!(!p.biblioteca.carpetas().unwrap()[0].perdida);
+
+    // El siguiente escaneo no pierde nada ni vuelve a abrir los cómics.
+    let resumen = escanear(&mut p.biblioteca);
+    assert_eq!((resumen.nuevos, resumen.borrados), (0, 0));
+    let saga = p.biblioteca.comics_de_serie("Saga").unwrap().remove(0);
+    assert!(saga.ruta.starts_with(&destino) && saga.ruta.exists());
+    assert_eq!(saga.progreso.map(|g| g.pagina), Some(1));
+}
+
+#[test]
+fn una_carpeta_reorganizada_y_renombrada_tambien() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let maus = p.biblioteca.comics_de_serie("Maus").unwrap().remove(0);
+    p.biblioteca
+        .guardar_progreso(&maus.huella, 0, true)
+        .unwrap();
+
+    // Todos los archivos, planos en otra carpeta y con otros nombres; la vieja desaparece.
+    let destino = p._temporal.path().join("nueva");
+    fs::create_dir_all(&destino).unwrap();
+    let mut n = 0;
+    for serie in p.biblioteca.series().unwrap() {
+        for comic in p.biblioteca.comics_de_serie(&serie.clave).unwrap() {
+            if comic.ruta.is_file() {
+                fs::rename(&comic.ruta, destino.join(format!("renombrado {n}.cbz"))).unwrap();
+                n += 1;
+            }
+        }
+    }
+    fs::remove_dir_all(&p.comics).unwrap();
+
+    let informe = p
+        .biblioteca
+        .reubicar_automaticamente(&[p._temporal.path().to_path_buf()])
+        .unwrap();
+    assert_eq!((informe.carpetas, informe.sin_encontrar), (1, 0));
+
+    escanear(&mut p.biblioteca);
+    // Con otro nombre ya es otra serie, pero es el mismo cómic: conserva su progreso.
+    let mut todos = Vec::new();
+    for serie in p.biblioteca.series().unwrap() {
+        todos.extend(p.biblioteca.comics_de_serie(&serie.clave).unwrap());
+    }
+    assert!(todos.iter().all(|f| f.ruta.starts_with(&destino)));
+    let reencontrado = todos.iter().find(|f| f.huella == maus.huella).unwrap();
+    assert_eq!(reencontrado.progreso.map(|g| g.terminado), Some(true));
+}
+
+#[test]
+fn los_comics_sueltos_de_una_carpeta_propia_se_reencuentran() {
+    let mut p = preparar();
+    let propia = p.biblioteca.crear_carpeta_propia("Mis cosas").unwrap();
+    let suelto = p._temporal.path().join("Descargas/Suelto.cbz");
+    crear_cbz(&suelto, 4, None);
+    assert_eq!(
+        p.biblioteca
+            .anadir_archivos(propia.id, std::slice::from_ref(&suelto))
+            .unwrap(),
+        1
+    );
+    escanear(&mut p.biblioteca);
+
+    let fijo = |p: &Prueba| {
+        p.biblioteca
+            .carpetas()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.propia)
+            .unwrap()
+            .archivos_perdidos
+    };
+    assert_eq!(fijo(&p), 0);
+
+    let nuevo = p._temporal.path().join("Lectura/Con otro nombre.cbz");
+    fs::create_dir_all(nuevo.parent().unwrap()).unwrap();
+    fs::rename(&suelto, &nuevo).unwrap();
+    assert_eq!(fijo(&p), 1);
+
+    let informe = p
+        .biblioteca
+        .reubicar_automaticamente(&[p._temporal.path().join("Lectura")])
+        .unwrap();
+    assert_eq!((informe.archivos, informe.sin_encontrar), (1, 0));
+    assert_eq!(fijo(&p), 0);
+
+    let resumen = escanear(&mut p.biblioteca);
+    assert_eq!(resumen.borrados, 0);
+    assert_eq!(
+        p.biblioteca
+            .comics_de_serie("Con otro nombre")
+            .unwrap()
+            .len()
+            + p.biblioteca.comics_de_serie("Suelto").unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn reubicar_a_mano_y_fundir_con_una_carpeta_que_ya_la_cubre() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let id = p.biblioteca.carpetas().unwrap()[0].id;
+
+    // A algo que no es una carpeta.
+    assert!(p
+        .biblioteca
+        .reubicar_carpeta(id, p.comics.join("nada"))
+        .is_err());
+
+    // Otra carpeta con la que no se solapa.
+    let otra = p._temporal.path().join("otra");
+    fs::create_dir_all(&otra).unwrap();
+    p.biblioteca.reubicar_carpeta(id, &otra).unwrap();
+    assert_eq!(p.biblioteca.carpetas().unwrap()[0].ruta, otra);
+
+    // Una segunda carpeta que acaba dentro de la primera se funde con ella.
+    let hermana = p._temporal.path().join("hermana");
+    fs::create_dir_all(&hermana).unwrap();
+    let segunda = p.biblioteca.agregar_carpeta(&hermana).unwrap();
+    let dentro = otra.join("dentro");
+    fs::create_dir_all(&dentro).unwrap();
+    p.biblioteca.reubicar_carpeta(segunda.id, &dentro).unwrap();
+    assert_eq!(p.biblioteca.carpetas().unwrap().len(), 1);
+}
+
+#[test]
+fn se_puede_marcar_como_leido_y_como_no_leido() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("Saga").unwrap();
+    let (a, b) = (&saga[0], &saga[1]);
+
+    p.biblioteca.marcar_leido(&a.huella, true).unwrap();
+    let progreso = p.biblioteca.progreso(&a.huella).unwrap().unwrap();
+    assert!(progreso.terminado);
+    assert_eq!(progreso.pagina, a.paginas - 1);
+
+    p.biblioteca.marcar_leido(&a.huella, false).unwrap();
+    assert!(p.biblioteca.progreso(&a.huella).unwrap().is_none());
+
+    // Una serie entera de golpe.
+    assert_eq!(p.biblioteca.marcar_serie_leida("saga", true).unwrap(), 2);
+    assert!(p.biblioteca.progreso(&b.huella).unwrap().unwrap().terminado);
+    let serie = p
+        .biblioteca
+        .series()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.nombre == "Saga")
+        .unwrap();
+    assert_eq!(serie.terminados, serie.comics);
+
+    // Uno que no se pudo abrir no tiene páginas: no se da por leído.
+    let roto = p.biblioteca.comics_de_serie("roto").unwrap().remove(0);
+    p.biblioteca.marcar_leido(&roto.huella, true).unwrap();
+    assert!(p.biblioteca.progreso(&roto.huella).unwrap().is_none());
 }

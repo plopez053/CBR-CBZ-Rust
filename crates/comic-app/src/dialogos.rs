@@ -25,6 +25,10 @@ pub enum Dialogo {
     ComicsParaSerie,
     /// Una o varias carpetas con cómics para la serie abierta.
     CarpetasParaSerie,
+    /// La carpeta donde buscar los cómics que se han movido de sitio.
+    DondeBuscar,
+    /// El sitio nuevo de una carpeta de la biblioteca (su id) que ya no está donde estaba.
+    NuevaUbicacion(i64),
 }
 
 /// Abre el selector. El resultado llega por el canal: lo elegido, o nada si se cancela.
@@ -70,15 +74,19 @@ fn selector(dialogo: Dialogo) -> rfd::FileDialog {
             .set_title("Añadir cómics a la serie")
             .add_filter("Cómics", &EXTENSIONES),
         Dialogo::CarpetasParaSerie => selector.set_title("Añadir carpetas a la serie"),
+        Dialogo::DondeBuscar => selector
+            .set_title("Elige la carpeta donde buscar tus cómics (se miran sus subcarpetas)"),
+        Dialogo::NuevaUbicacion(_) => selector.set_title("Elige dónde está ahora esta carpeta"),
     }
 }
 
 fn elegir(selector: rfd::FileDialog, dialogo: Dialogo) -> Vec<PathBuf> {
     match dialogo {
         Dialogo::Comic => selector.pick_file().into_iter().collect(),
-        Dialogo::CarpetaDeBiblioteca | Dialogo::CarpetaDeImagenes => {
-            selector.pick_folder().into_iter().collect()
-        }
+        Dialogo::CarpetaDeBiblioteca
+        | Dialogo::CarpetaDeImagenes
+        | Dialogo::DondeBuscar
+        | Dialogo::NuevaUbicacion(_) => selector.pick_folder().into_iter().collect(),
         Dialogo::ComicsParaCarpeta(_) | Dialogo::ComicsParaSerie => {
             selector.pick_files().unwrap_or_default()
         }

@@ -7,6 +7,7 @@ mod escaneo;
 mod esquema;
 mod externas;
 mod favoritos;
+mod reubicar;
 mod serie;
 
 use std::cmp::Ordering;
@@ -20,6 +21,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 pub use escaneo::{huella, Resumen};
 pub use externas::{Coleccion, EstadoVinculo, SerieExterna, Vinculo};
 pub use favoritos::Favorito;
+pub use reubicar::Informe;
 pub use serie::clave_de_serie;
 
 use serie::nombre_de_grupo;
@@ -39,6 +41,11 @@ pub struct Carpeta {
     pub propia: bool,
     /// Cuántos cómics tiene ahora mismo.
     pub comics: usize,
+    /// Una carpeta del disco que ya no existe (se movió, se renombró o el disco no está).
+    /// Sus cómics se conservan, pero no se pueden abrir hasta reubicarla.
+    pub perdida: bool,
+    /// En una carpeta propia, cuántos de sus cómics sueltos ya no están donde se añadieron.
+    pub archivos_perdidos: usize,
 }
 
 /// Por dónde va la lectura de un cómic.
@@ -254,12 +261,24 @@ impl Biblioteca {
     /// Las carpetas que el usuario ve (no la oculta donde van los cómics metidos a mano en
     /// una serie).
     pub fn carpetas(&self) -> Result<Vec<Carpeta>, String> {
-        Ok(self
+        let mut carpetas: Vec<Carpeta> = self
             .todas_las_carpetas()?
             .into_iter()
             .filter(|(_, oculta)| !oculta)
             .map(|(carpeta, _)| carpeta)
-            .collect())
+            .collect();
+        for carpeta in &mut carpetas {
+            if carpeta.propia {
+                carpeta.archivos_perdidos = self
+                    .archivos_propios(carpeta.id)?
+                    .iter()
+                    .filter(|ruta| !ruta.exists())
+                    .count();
+            } else {
+                carpeta.perdida = !carpeta.ruta.is_dir();
+            }
+        }
+        Ok(carpetas)
     }
 
     /// Todas las carpetas, con si están ocultas.
@@ -280,6 +299,8 @@ impl Biblioteca {
                     ruta: PathBuf::from(fila.get::<_, String>(1)?),
                     propia: fila.get(2)?,
                     comics: fila.get::<_, i64>(3)? as usize,
+                    perdida: false,
+                    archivos_perdidos: 0,
                 };
                 Ok((carpeta, fila.get(4)?))
             })
@@ -315,6 +336,8 @@ impl Biblioteca {
             ruta,
             propia: false,
             comics: 0,
+            perdida: false,
+            archivos_perdidos: 0,
         })
     }
 
@@ -349,6 +372,8 @@ impl Biblioteca {
             ruta: PathBuf::from(nombre),
             propia: true,
             comics: 0,
+            perdida: false,
+            archivos_perdidos: 0,
         })
     }
 
@@ -1075,6 +1100,42 @@ impl Biblioteca {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Marca un cómic como leído (en su última página) o como no leído (sin progreso).
+    pub fn marcar_leido(&self, huella: &str, leido: bool) -> Result<(), String> {
+        if !leido {
+            self.db
+                .execute("DELETE FROM progreso WHERE huella = ?1", [huella])
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let paginas: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT paginas FROM comics WHERE huella = ?1 LIMIT 1",
+                [huella],
+                |f| f.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match paginas {
+            Some(paginas) if paginas > 0 => {
+                self.guardar_progreso(huella, paginas as usize - 1, true)
+            }
+            // Sin páginas (no se pudo abrir) no hay nada que dar por leído.
+            _ => Ok(()),
+        }
+    }
+
+    /// Marca todos los cómics de una serie como leídos o como no leídos. Devuelve a
+    /// cuántos afecta.
+    pub fn marcar_serie_leida(&self, clave: &str, leido: bool) -> Result<usize, String> {
+        let comics = self.comics_de_serie(clave)?;
+        for comic in &comics {
+            self.marcar_leido(&comic.huella, leido)?;
+        }
+        Ok(comics.len())
     }
 
     pub fn progreso(&self, huella: &str) -> Result<Option<Progreso>, String> {

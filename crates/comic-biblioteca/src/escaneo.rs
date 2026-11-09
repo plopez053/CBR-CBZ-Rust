@@ -238,7 +238,7 @@ impl Biblioteca {
     }
 
     /// Los cómics sueltos que se han añadido a mano a una carpeta propia.
-    fn archivos_propios(&self, carpeta: i64) -> Result<Vec<PathBuf>, String> {
+    pub(crate) fn archivos_propios(&self, carpeta: i64) -> Result<Vec<PathBuf>, String> {
         let mut consulta = self
             .db
             .prepare("SELECT ruta FROM archivos_propios WHERE carpeta = ?1 ORDER BY ruta")
