@@ -4,3 +4,6 @@
 # Cómics de prueba personales en la raíz (los de tests/fixtures sí se suben)
 /*.cbz
 /*.cbr
+
+# Pestana opcional de fuentes: personal, la app compila igual sin ella
+/crates/comic-app/src/fuentes.rs

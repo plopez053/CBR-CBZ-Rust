@@ -56,6 +56,8 @@ pub fn ventana(actual: usize, total: usize) -> RangeInclusive<usize> {
 struct Peticion {
     indice: usize,
     caja: Tamano,
+    /// Buscar también sus recuadros, para leerla por viñetas.
+    vinetas: bool,
 }
 
 /// Una página ya preparada para subir a la GPU.
@@ -66,6 +68,9 @@ pub struct Pagina {
     /// Tamaño de la imagen tal como viene en el archivo.
     pub original: Tamano,
     pub imagen: egui::ColorImage,
+    /// Sus recuadros en orden de lectura, si se pidieron: en fracciones de la página (de 0
+    /// a 1). Vacío si no se encontró ninguno; entonces se lee la página entera.
+    pub recuadros: Option<Vec<egui::Rect>>,
 }
 
 /// Lo que contesta un hilo por cada página que se le pidió.
@@ -146,9 +151,14 @@ impl Precargador {
         self.estado.caja.store(empaquetar(caja), Ordering::Relaxed);
     }
 
-    /// Pide una página encogida para caber en `caja`. No espera: la respuesta llega más tarde.
-    pub fn pedir(&self, indice: usize, caja: Tamano) {
-        let _ = self.peticiones.send(Peticion { indice, caja });
+    /// Pide una página encogida para caber en `caja` y, con `vinetas`, sus recuadros.
+    /// No espera: la respuesta llega más tarde.
+    pub fn pedir(&self, indice: usize, caja: Tamano, vinetas: bool) {
+        let _ = self.peticiones.send(Peticion {
+            indice,
+            caja,
+            vinetas,
+        });
     }
 
     /// Recoge las respuestas que ya hayan llegado, sin bloquear.
@@ -178,7 +188,12 @@ impl Trabajador {
             // El candado se suelta al acabar esta línea: mientras decodificamos,
             // los demás hilos pueden ir cogiendo peticiones.
             let peticion = self.peticiones.lock().unwrap().recv();
-            let Ok(Peticion { indice, caja }) = peticion else {
+            let Ok(Peticion {
+                indice,
+                caja,
+                vinetas,
+            }) = peticion
+            else {
                 break;
             };
 
@@ -197,12 +212,13 @@ impl Trabajador {
                 eprintln!("[{id_hilo:?}] Página {indice} descartada ({motivo})");
                 Respuesta::Descartada(indice, caja)
             } else {
-                match self.preparar(indice, caja, &mut encogedor) {
-                    Ok((original, imagen)) => Respuesta::Lista(Pagina {
+                match self.preparar(indice, caja, vinetas, &mut encogedor) {
+                    Ok((original, imagen, recuadros)) => Respuesta::Lista(Pagina {
                         indice,
                         caja,
                         original,
                         imagen,
+                        recuadros,
                     }),
                     Err(e) => {
                         eprintln!("[{id_hilo:?}] Página {indice} error: {e}");
@@ -221,20 +237,24 @@ impl Trabajador {
     }
 
     /// Lee, decodifica y encoge una página para que quepa en `caja`.
-    /// Devuelve también el tamaño original, que la ventana necesita para el zoom.
+    /// Devuelve también el tamaño original, que la ventana necesita para el zoom, y con
+    /// `vinetas` sus recuadros, buscados en la imagen a tamaño completo.
     fn preparar(
         &mut self,
         indice: usize,
         caja: Tamano,
+        vinetas: bool,
         encogedor: &mut Encogedor,
-    ) -> Result<(Tamano, egui::ColorImage), String> {
+    ) -> Result<(Tamano, egui::ColorImage, Option<Vec<egui::Rect>>), String> {
         let inicio = Instant::now();
         let bytes = self.comic.leer(indice)?;
         let original = comic_imagen::decodificar(&bytes)?;
         let decodificada = inicio.elapsed();
+        let recuadros = vinetas.then(|| buscar_recuadros(&original, indice));
 
         let (ancho, alto) = (original.ancho, original.alto);
         let [destino_ancho, destino_alto] = tamano_textura([ancho, alto], caja);
+        let antes_de_encoger = Instant::now();
         // Si se va a ver a su tamaño o más grande, sale tal cual.
         let encogida = encogedor.encoger(original, destino_ancho, destino_alto)?;
 
@@ -243,13 +263,44 @@ impl Trabajador {
              (decodificar {:.1}ms, encoger {:.1}ms)",
             thread::current().id(),
             decodificada.as_secs_f64() * 1000.0,
-            (inicio.elapsed() - decodificada).as_secs_f64() * 1000.0,
+            antes_de_encoger.elapsed().as_secs_f64() * 1000.0,
         );
 
         let tamano = [destino_ancho as usize, destino_alto as usize];
         let imagen = egui::ColorImage::from_rgba_unmultiplied(tamano, &encogida.rgba);
-        Ok(([ancho, alto], imagen))
+        Ok(([ancho, alto], imagen, recuadros))
     }
+}
+
+/// Los recuadros de una página, en fracciones de la página y en orden de manga (de
+/// derecha a izquierda). La portada no se parte: se ve entera.
+fn buscar_recuadros(imagen: &comic_imagen::Imagen, indice: usize) -> Vec<egui::Rect> {
+    if indice == 0 {
+        return Vec::new();
+    }
+    let inicio = Instant::now();
+    let (ancho, alto) = (imagen.ancho as f32, imagen.alto as f32);
+    let recuadros: Vec<egui::Rect> = comic_vinetas::detectar(
+        &imagen.rgba,
+        imagen.ancho,
+        imagen.alto,
+        comic_vinetas::Sentido::DerechaAIzquierda,
+    )
+    .into_iter()
+    .map(|r| {
+        egui::Rect::from_min_size(
+            egui::pos2(r.x as f32 / ancho, r.y as f32 / alto),
+            egui::vec2(r.ancho as f32 / ancho, r.alto as f32 / alto),
+        )
+    })
+    .collect();
+    eprintln!(
+        "[{:?}] Página {indice}: {} recuadros ({:.1}ms)",
+        thread::current().id(),
+        recuadros.len(),
+        inicio.elapsed().as_secs_f64() * 1000.0,
+    );
+    recuadros
 }
 
 #[cfg(test)]

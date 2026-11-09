@@ -175,28 +175,44 @@ impl Trabajador {
         peticion: &Peticion,
         encogedor: &mut Encogedor,
     ) -> Result<egui::ColorImage, String> {
-        let archivo = self
-            .carpeta
-            .join(format!("{}.jpg", peticion.portada.huella));
-
-        let guardada = fs::read(&archivo)
-            .ok()
-            .and_then(|bytes| comic_imagen::decodificar(&bytes).ok());
-        let grande = match guardada {
-            Some(imagen) => imagen,
-            None => {
-                let imagen = sacar_del_comic(&peticion.portada, encogedor)?;
-                guardar(&archivo, &imagen);
-                imagen
-            }
-        };
-
+        let grande = portada_en_disco(&self.carpeta, &peticion.portada, encogedor)?;
         let [ancho, alto] = tamano_textura([grande.ancho, grande.alto], peticion.caja);
         let imagen = encogedor.encoger(grande, ancho, alto)?;
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [ancho as usize, alto as usize],
             &imagen.rgba,
         ))
+    }
+}
+
+/// La portada al tamaño de disco: la guardada en `carpeta` o, si aún no está, sacada del
+/// cómic (y guardada para la próxima vez).
+pub fn portada_en_disco(
+    carpeta: &Path,
+    portada: &Portada,
+    encogedor: &mut Encogedor,
+) -> Result<Imagen, String> {
+    let archivo = carpeta.join(format!("{}.jpg", portada.huella));
+    let guardada = fs::read(&archivo)
+        .ok()
+        .and_then(|bytes| comic_imagen::decodificar(&bytes).ok());
+    match guardada {
+        Some(imagen) => Ok(imagen),
+        None => {
+            let imagen = sacar_del_comic(portada, encogedor)?;
+            guardar(&archivo, &imagen);
+            Ok(imagen)
+        }
+    }
+}
+
+/// Borra la miniatura guardada de un cómic: la próxima vez se saca otra vez de su portada.
+pub fn borrar_en_disco(carpeta: &Path, huella: &str) {
+    let archivo = carpeta.join(format!("{huella}.jpg"));
+    if let Err(e) = fs::remove_file(&archivo) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("[miniaturas] No se pudo borrar {}: {e}", archivo.display());
+        }
     }
 }
 

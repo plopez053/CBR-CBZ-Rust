@@ -19,15 +19,21 @@ pub enum Dialogo {
     Comic,
     /// Una carpeta de imágenes para leerla como cómic.
     CarpetaDeImagenes,
+    /// Uno o varios cómics sueltos para una carpeta propia de la biblioteca (su id).
+    ComicsParaCarpeta(i64),
+    /// Uno o varios cómics sueltos para la serie abierta.
+    ComicsParaSerie,
+    /// Una o varias carpetas con cómics para la serie abierta.
+    CarpetasParaSerie,
 }
 
-/// Abre el selector. El resultado llega por el canal: `None` si se cancela.
+/// Abre el selector. El resultado llega por el canal: lo elegido, o nada si se cancela.
 ///
 /// En Windows se abre en el hilo de la ventana y por encima de ella, como hacen todos
 /// los programas. En Linux va en otro hilo: el portal tarda en contestar y, si la
 /// ventana dejara de responder mientras tanto, el escritorio avisaría de que la app
 /// se ha colgado.
-pub fn abrir(dialogo: Dialogo, ventana: &eframe::Frame) -> Receiver<Option<PathBuf>> {
+pub fn abrir(dialogo: Dialogo, ventana: &eframe::Frame) -> Receiver<Vec<PathBuf>> {
     let (enviar, recibir) = mpsc::channel();
 
     #[cfg(windows)]
@@ -57,12 +63,25 @@ fn selector(dialogo: Dialogo) -> rfd::FileDialog {
             .set_title("Abrir un cómic")
             .add_filter("Cómics", &EXTENSIONES),
         Dialogo::CarpetaDeImagenes => selector.set_title("Abrir una carpeta de imágenes"),
+        Dialogo::ComicsParaCarpeta(_) => selector
+            .set_title("Añadir cómics a la carpeta")
+            .add_filter("Cómics", &EXTENSIONES),
+        Dialogo::ComicsParaSerie => selector
+            .set_title("Añadir cómics a la serie")
+            .add_filter("Cómics", &EXTENSIONES),
+        Dialogo::CarpetasParaSerie => selector.set_title("Añadir carpetas a la serie"),
     }
 }
 
-fn elegir(selector: rfd::FileDialog, dialogo: Dialogo) -> Option<PathBuf> {
+fn elegir(selector: rfd::FileDialog, dialogo: Dialogo) -> Vec<PathBuf> {
     match dialogo {
-        Dialogo::Comic => selector.pick_file(),
-        Dialogo::CarpetaDeBiblioteca | Dialogo::CarpetaDeImagenes => selector.pick_folder(),
+        Dialogo::Comic => selector.pick_file().into_iter().collect(),
+        Dialogo::CarpetaDeBiblioteca | Dialogo::CarpetaDeImagenes => {
+            selector.pick_folder().into_iter().collect()
+        }
+        Dialogo::ComicsParaCarpeta(_) | Dialogo::ComicsParaSerie => {
+            selector.pick_files().unwrap_or_default()
+        }
+        Dialogo::CarpetasParaSerie => selector.pick_folders().unwrap_or_default(),
     }
 }

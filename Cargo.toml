@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/comic-core", "crates/comic-imagen", "crates/comic-biblioteca", "crates/comic-app"]
+members = ["crates/comic-core", "crates/comic-imagen", "crates/comic-biblioteca", "crates/comic-novedades", "crates/comic-vinetas", "crates/comic-app"]
 
 # Valores compartidos: cada crate los hereda con `version.workspace = true`, etc.
 [workspace.package]
@@ -17,4 +17,9 @@ opt-level = 3
 # crate que lo llama. Por eso todo ese trabajo vive en `comic-imagen` y se optimiza solo
 # ese crate (sin esto, encoger una página tarda ~2 s en vez de ~30 ms).
 [profile.dev.package.comic-imagen]
+opt-level = 3
+
+# Buscar los recuadros recorre la página entera varias veces: sin optimizar, en
+# desarrollo iría decenas de veces más lento que en la app instalada.
+[profile.dev.package.comic-vinetas]
 opt-level = 3

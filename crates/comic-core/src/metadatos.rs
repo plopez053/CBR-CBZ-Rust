@@ -196,7 +196,12 @@ pub fn de_nombre(nombre: &str) -> Metadatos {
         let rango = c.get(0).unwrap().range();
         principal.replace_range(rango, " ");
     }
-    let principal = espacios_simples(&principal);
+    // Al quitar el volumen puede quedar un separador colgando ("Vinland Saga - ").
+    let mut principal = espacios_simples(&principal);
+    while principal.contains("- -") {
+        principal = principal.replace("- -", "-");
+    }
+    let principal = limpiar(&principal);
 
     let partes: Vec<&str> = principal.split(" - ").map(str::trim).collect();
     // `Serie - 001 - Título`: una parte que es solo un número separa serie y título.
@@ -217,6 +222,10 @@ pub fn de_nombre(nombre: &str) -> Metadatos {
     } else if let Some(c) = NUMERO_AL_FINAL.captures(partes[0]) {
         datos.serie = Some(c[1].trim().to_string()).filter(|s| !s.is_empty());
         datos.numero = Some(normalizar_numero(&c[2]));
+        datos.titulo = unir(&partes[1..]);
+    } else if datos.volumen.is_some() && partes.len() > 1 {
+        // `Serie - Vol. 3 - Título`: lo que va tras el volumen es el título.
+        datos.serie = unir(&partes[..1]);
         datos.titulo = unir(&partes[1..]);
     } else {
         datos.serie = unir(&partes);
@@ -254,7 +263,38 @@ const PALABRAS_SIN_SERIE: [&str; 13] = [
 
 /// Junta las partes con ` - `, o nada si no hay partes.
 fn unir(partes: &[&str]) -> Option<String> {
-    Some(partes.join(" - ")).filter(|s| !s.is_empty())
+    Some(limpiar(&partes.join(" - "))).filter(|s| !s.is_empty())
+}
+
+/// Quita los separadores que sobran al principio y al final: espacios, guiones, comas...
+fn limpiar(texto: &str) -> String {
+    texto
+        .trim_matches(|c: char| c.is_whitespace() || "-–—_,:;|/".contains(c))
+        .to_string()
+}
+
+/// Serie que se deduce del nombre de la carpeta donde está un cómic, para los que no la
+/// dicen en sus metadatos ni en su nombre. Quita lo que no es el nombre de la serie:
+/// rangos de tomos (`T01-04`, `Tomo 5-8`, `Vol. 1-4`, `#001-028`) y lo que va entre
+/// paréntesis o corchetes (año, fuente, grupo). `Vinland-T01-04` queda en `Vinland`.
+pub fn serie_de_carpeta(nombre: &str) -> String {
+    static RANGO: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)(?:^|[\s_.\-])(?:t|tomo|tomos|vol\.?|volumen|v|cap\.?|capitulos?|ch\.?|#)?\s*\d+\s*[-–]\s*(?:t|tomo|vol\.?|v|cap\.?|ch\.?|#)?\s*\d+(?:$|[\s_.\-)\]])",
+        )
+        .unwrap()
+    });
+
+    let nombre = nombre.replace('_', " ");
+    let fin = nombre.find(['(', '[']).unwrap_or(nombre.len());
+    let sin_rango = RANGO.replace_all(&nombre[..fin], " ");
+    let limpio = limpiar(&espacios_simples(&sin_rango));
+    // Si no queda nada (la carpeta se llama solo "01-04"), mejor el nombre tal cual.
+    if limpio.is_empty() {
+        limpiar(&espacios_simples(&nombre[..fin]))
+    } else {
+        limpio
+    }
 }
 
 fn espacios_simples(texto: &str) -> String {
@@ -262,7 +302,8 @@ fn espacios_simples(texto: &str) -> String {
 }
 
 /// `001` -> `1`, `#54` -> `54`, `007.5` -> `7.5`. Lo que no empieza por cifra se deja igual.
-fn normalizar_numero(numero: &str) -> String {
+/// Un número de cómic sin `#` ni ceros a la izquierda: `#007` da `7` y `0.5` se queda igual.
+pub fn normalizar_numero(numero: &str) -> String {
     let numero = numero.trim().trim_start_matches('#');
     if !numero.starts_with(|c: char| c.is_ascii_digit()) {
         return numero.to_string();
@@ -371,6 +412,39 @@ mod tests {
         );
         assert_eq!(nombre("Maus"), (s("Maus"), None, None, None, None));
         assert_eq!(nombre("001"), (None, s("1"), None, None, None));
+    }
+
+    #[test]
+    fn el_guion_que_queda_al_quitar_el_tomo_se_limpia() {
+        assert_eq!(
+            nombre("Vinland Saga - Tomo 01 (#001-005)"),
+            (s("Vinland Saga"), None, Some(1), None, None)
+        );
+        assert_eq!(
+            nombre("Vinland Saga - Tomo 12 (#079-086)"),
+            (s("Vinland Saga"), None, Some(12), None, None)
+        );
+        assert_eq!(
+            nombre("Berserk - Vol. 03 - La espada"),
+            (s("Berserk"), None, Some(3), s("La espada"), None)
+        );
+    }
+
+    #[test]
+    fn serie_a_partir_de_la_carpeta() {
+        assert_eq!(serie_de_carpeta("Vinland-T01-04"), "Vinland");
+        assert_eq!(serie_de_carpeta("Vinland-T05-08"), "Vinland");
+        assert_eq!(serie_de_carpeta("Vinland Saga Tomo 5-8"), "Vinland Saga");
+        assert_eq!(
+            serie_de_carpeta("Berserk Vol. 1-14 (Digital) [Grupo]"),
+            "Berserk"
+        );
+        assert_eq!(serie_de_carpeta("X-Men 1-12"), "X-Men");
+        assert_eq!(serie_de_carpeta("Batman (2016)"), "Batman");
+        // Lo que no es un rango se queda como está.
+        assert_eq!(serie_de_carpeta("Spider-Man 2099"), "Spider-Man 2099");
+        assert_eq!(serie_de_carpeta("Akira"), "Akira");
+        assert_eq!(serie_de_carpeta("01-04"), "01-04");
     }
 
     #[test]

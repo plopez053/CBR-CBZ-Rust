@@ -1,0 +1,10 @@
+[package]
+name = "comic-vinetas"
+version.workspace = true
+edition.workspace = true
+
+# Sin dependencias: trabaja sobre los píxeles que le pasen.
+
+[dev-dependencies]
+comic-core = { path = "../comic-core" }
+comic-imagen = { path = "../comic-imagen" }

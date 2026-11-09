@@ -5,7 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use comic_biblioteca::{Biblioteca, Resumen};
+use comic_biblioteca::{
+    Biblioteca, EstadoVinculo, Favorito, Movimiento, Resumen, SerieExterna, Vinculo,
+};
 use tempfile::TempDir;
 
 /// Crea un `.cbz` con `paginas` imágenes y, si se da, un `ComicInfo.xml`.
@@ -298,6 +300,337 @@ fn una_caratula_no_oculta_los_comics_de_las_subcarpetas() {
     assert_eq!(biblioteca.comics_de_serie("Akira").unwrap()[0].paginas, 2);
 }
 
+/// Los archivos de Vinland Saga tal como los tiene el usuario: tres carpetas de cuatro
+/// tomos cada una, con nombres como `Vinland Saga - Tomo 01 (#001-005).cbr`.
+fn vinland(comics: &Path) {
+    for (carpeta, tomos) in [("Vinland-T01-04", 1..=4), ("Vinland-T05-08", 5..=8)] {
+        for tomo in tomos {
+            let nombre = format!("Vinland Saga - Tomo {tomo:02} (#001-005).cbz");
+            crear_cbz(&comics.join(carpeta).join(nombre), 2, None);
+        }
+    }
+}
+
+#[test]
+fn las_carpetas_de_una_misma_serie_se_juntan() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    vinland(&comics);
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca
+        .agregar_carpeta(comics.join("Vinland-T01-04"))
+        .unwrap();
+    biblioteca
+        .agregar_carpeta(comics.join("Vinland-T05-08"))
+        .unwrap();
+    escanear(&mut biblioteca);
+
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [("Vinland Saga".to_string(), 8)]
+    );
+    // En orden de tomos, aunque estén en carpetas distintas.
+    let volumenes: Vec<_> = biblioteca
+        .comics_de_serie("Vinland Saga")
+        .unwrap()
+        .iter()
+        .map(|f| f.metadatos.volumen)
+        .collect();
+    assert_eq!(volumenes, (1..=8).map(Some).collect::<Vec<_>>());
+}
+
+#[test]
+fn sin_serie_en_el_nombre_se_usa_la_carpeta_sin_el_rango_de_tomos() {
+    // Archivos que no dicen de qué serie son: solo la carpeta lo sabe.
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(&comics.join("Vinland-T01-04/Tomo 01.cbz"), 2, None);
+    crear_cbz(&comics.join("Vinland-T01-04/Tomo 02.cbz"), 2, None);
+    crear_cbz(&comics.join("Vinland-T05-08/Tomo 05.cbz"), 2, None);
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    assert_eq!(nombres_de_series(&biblioteca), [("Vinland".to_string(), 3)]);
+}
+
+#[test]
+fn lo_que_no_dice_su_serie_entra_solo_en_la_de_al_lado() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    vinland(&comics);
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    // Llega una carpeta nueva cuyos archivos no dicen de qué serie son.
+    crear_cbz(&comics.join("Vinland-T13-16/Tomo 13.cbz"), 2, None);
+    crear_cbz(&comics.join("Vinland-T13-16/Tomo 14.cbz"), 2, None);
+    escanear(&mut biblioteca);
+
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [("Vinland Saga".to_string(), 10)]
+    );
+    let volumenes: Vec<_> = biblioteca
+        .comics_de_serie("Vinland Saga")
+        .unwrap()
+        .iter()
+        .map(|f| f.metadatos.volumen.unwrap())
+        .collect();
+    assert_eq!(volumenes, [1, 2, 3, 4, 5, 6, 7, 8, 13, 14]);
+}
+
+#[test]
+fn y_tambien_al_reves_si_la_serie_llega_despues() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(&comics.join("Vinland-T13-16/Tomo 13.cbz"), 2, None);
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+    assert_eq!(nombres_de_series(&biblioteca), [("Vinland".to_string(), 1)]);
+
+    vinland(&comics);
+    escanear(&mut biblioteca);
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [("Vinland Saga".to_string(), 9)]
+    );
+
+    // Y si la serie fiable desaparece, el cómic vuelve a la de su carpeta.
+    fs::remove_dir_all(comics.join("Vinland-T01-04")).unwrap();
+    fs::remove_dir_all(comics.join("Vinland-T05-08")).unwrap();
+    escanear(&mut biblioteca);
+    assert_eq!(nombres_de_series(&biblioteca), [("Vinland".to_string(), 1)]);
+}
+
+#[test]
+fn si_encajan_varias_series_no_adivina() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(&comics.join("Batman Beyond/Batman Beyond 001.cbz"), 1, None);
+    crear_cbz(
+        &comics.join("Batman Year One/Batman Year One 001.cbz"),
+        1,
+        None,
+    );
+    crear_cbz(&comics.join("Batman-T01-02/Tomo 1.cbz"), 1, None);
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [
+            ("Batman".to_string(), 1),
+            ("Batman Beyond".to_string(), 1),
+            ("Batman Year One".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn una_serie_que_solo_empieza_parecido_no_se_une_si_esta_lejos() {
+    // Lo débil (la carpeta) solo se fía de lo que tiene cerca: dos sitios distintos
+    // de la biblioteca pueden tener series distintas que empiezan igual.
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(
+        &comics.join("DC/Batman Beyond/Batman Beyond 001.cbz"),
+        1,
+        None,
+    );
+    crear_cbz(&comics.join("Manga/Batman-T01-02/Tomo 1.cbz"), 1, None);
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    assert_eq!(biblioteca.series().unwrap().len(), 2);
+}
+
+#[test]
+fn series_con_otra_escritura_son_la_misma() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    let xml = |serie: &str| format!("<ComicInfo><Series>{serie}</Series></ComicInfo>");
+    crear_cbz(&comics.join("a.cbz"), 1, Some(&xml("Y: el último hombre")));
+    crear_cbz(&comics.join("b.cbz"), 1, Some(&xml("Y El Ultimo Hombre")));
+    crear_cbz(&comics.join("c.cbz"), 1, Some(&xml("y el ultimo hombre!")));
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    let series = biblioteca.series().unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].comics, 3);
+}
+
+#[test]
+fn el_usuario_puede_unir_y_separar_series() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    let xml = |serie: &str| format!("<ComicInfo><Series>{serie}</Series></ComicInfo>");
+    crear_cbz(&comics.join("a1.cbz"), 1, Some(&xml("Vinland")));
+    crear_cbz(&comics.join("a2.cbz"), 1, Some(&xml("Vinland")));
+    crear_cbz(&comics.join("b1.cbz"), 1, Some(&xml("Vinland Saga")));
+    crear_cbz(&comics.join("c1.cbz"), 1, Some(&xml("Berserk")));
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+    assert_eq!(biblioteca.series().unwrap().len(), 3);
+
+    let grupo = biblioteca.unir_series("Vinland Saga", "Vinland").unwrap();
+    let series = biblioteca.series().unwrap();
+    assert_eq!(series.len(), 2);
+    let vinland = series.iter().find(|s| s.clave == grupo).unwrap();
+    assert_eq!(vinland.comics, 3);
+    // Gana el nombre que más se repite.
+    assert_eq!(vinland.nombre, "Vinland");
+    // Se pide con cualquiera de los dos nombres.
+    assert_eq!(biblioteca.comics_de_serie("Vinland Saga").unwrap().len(), 3);
+    assert_eq!(biblioteca.comics_de_serie("Vinland").unwrap().len(), 3);
+
+    let unidas = biblioteca.series_unidas_a(&grupo).unwrap();
+    assert_eq!(unidas.len(), 1);
+    assert_eq!(unidas[0].nombre, "Vinland Saga");
+
+    // La unión sobrevive a un nuevo escaneo y a reabrir la biblioteca.
+    escanear(&mut biblioteca);
+    assert_eq!(biblioteca.series().unwrap().len(), 2);
+
+    biblioteca.separar_serie(&unidas[0]).unwrap();
+    assert_eq!(biblioteca.series().unwrap().len(), 3);
+    assert_eq!(biblioteca.comics_de_serie("Vinland").unwrap().len(), 2);
+}
+
+#[test]
+fn al_unir_se_queda_la_serie_con_mas_comics_pidas_el_orden_que_pidas() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    let xml = |serie: &str| format!("<ComicInfo><Series>{serie}</Series></ComicInfo>");
+    crear_cbz(&comics.join("a1.cbz"), 1, Some(&xml("Vinland")));
+    crear_cbz(&comics.join("a2.cbz"), 1, Some(&xml("Vinland")));
+    crear_cbz(&comics.join("b1.cbz"), 1, Some(&xml("Vinland Saga")));
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    // Desde la pantalla de "Vinland" se pide unirla con "Vinland Saga" (la pequeña).
+    let grupo = biblioteca.unir_series("Vinland", "Vinland Saga").unwrap();
+    let series = biblioteca.series().unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].nombre, "Vinland");
+    // Lo unido es la pequeña, no la propia serie.
+    let unidas = biblioteca.series_unidas_a(&grupo).unwrap();
+    assert_eq!(unidas.len(), 1);
+    assert_eq!(unidas[0].nombre, "Vinland Saga");
+}
+
+#[test]
+fn las_uniones_no_se_encadenan() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    let xml = |serie: &str| format!("<ComicInfo><Series>{serie}</Series></ComicInfo>");
+    for serie in ["Uno", "Dos", "Tres"] {
+        crear_cbz(&comics.join(format!("{serie}.cbz")), 1, Some(&xml(serie)));
+    }
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+
+    // Uno -> Dos, y luego Dos -> Tres: Uno tiene que acabar también en Tres.
+    biblioteca.unir_series("Uno", "Dos").unwrap();
+    let grupo = biblioteca.unir_series("Dos", "Tres").unwrap();
+    assert_eq!(biblioteca.series().unwrap().len(), 1);
+    assert_eq!(biblioteca.comics_de_serie("Uno").unwrap().len(), 3);
+    assert_eq!(biblioteca.series_unidas_a(&grupo).unwrap().len(), 2);
+    // Unir lo que ya está unido es un error, no un cambio silencioso.
+    assert!(biblioteca.unir_series("Uno", "Tres").is_err());
+}
+
+#[test]
+fn escanea_muchos_comics_a_la_vez_sin_perder_ninguno() {
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    // Más que una tanda (50) y que los hilos, para que se mezclen los resultados.
+    for serie in 0..8 {
+        for numero in 1..=40 {
+            crear_cbz(
+                &comics.join(format!("Serie {serie}/Serie {serie} {numero:03}.cbz")),
+                2,
+                None,
+            );
+        }
+    }
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    let mut avances = Vec::new();
+    let resumen = biblioteca
+        .escanear(|hechos, total| avances.push((hechos, total)))
+        .unwrap();
+
+    assert_eq!(resumen.nuevos, 320);
+    assert_eq!(avances.last(), Some(&(320, 320)));
+    // El progreso nunca retrocede.
+    assert!(avances.windows(2).all(|par| par[0].0 <= par[1].0));
+    let series = biblioteca.series().unwrap();
+    assert_eq!(series.len(), 8);
+    assert!(series.iter().all(|s| s.comics == 40));
+    // Cada cómic guardó sus propios datos, no los de otro hilo.
+    let primera = biblioteca.comics_de_serie("Serie 3").unwrap();
+    let numeros: Vec<_> = primera
+        .iter()
+        .map(|f| f.metadatos.numero.clone().unwrap())
+        .collect();
+    assert_eq!(numeros, (1..=40).map(|n| n.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn una_biblioteca_antigua_se_actualiza_sola() {
+    use rusqlite::Connection;
+
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(&comics.join("Vinland Saga - Tomo 01.cbz"), 2, None);
+    crear_cbz(&comics.join("Vinland Saga - Tomo 02.cbz"), 2, None);
+    let ruta_db = temporal.path().join("biblioteca.db");
+
+    let mut biblioteca = Biblioteca::abrir(&ruta_db).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+    drop(biblioteca);
+
+    // La deja como la dejaba la versión anterior: serie con el guion de más, sin clave
+    // y con el análisis sin hacer.
+    let db = Connection::open(&ruta_db).unwrap();
+    db.execute(
+        "UPDATE comics SET serie = 'Vinland Saga -', serie_clave = '', analisis = 0",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    // Al abrirla ya se agrupa bien, aunque todavía muestre el nombre viejo...
+    let mut biblioteca = Biblioteca::abrir(&ruta_db).unwrap();
+    assert_eq!(biblioteca.series().unwrap().len(), 1);
+    // ...y el siguiente escaneo vuelve a leer los cómics y lo corrige.
+    let resumen = escanear(&mut biblioteca);
+    assert_eq!(resumen.actualizados, 2);
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [("Vinland Saga".to_string(), 2)]
+    );
+    // Y la siguiente vez ya no hace falta.
+    assert_eq!(escanear(&mut biblioteca).sin_cambios, 2);
+}
+
 #[test]
 fn no_deja_añadir_carpetas_solapadas() {
     let p = preparar();
@@ -323,4 +656,557 @@ fn se_puede_volver_a_abrir() {
 
     let biblioteca = Biblioteca::abrir(&ruta).unwrap();
     assert_eq!(biblioteca.series().unwrap().len(), 1);
+}
+
+#[test]
+fn lo_que_hay_de_cada_serie() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+
+    let colecciones = p.biblioteca.colecciones().unwrap();
+    let nombres: Vec<&str> = colecciones.iter().map(|c| c.nombre.as_str()).collect();
+    assert_eq!(
+        nombres,
+        ["Akira", "Bleeding Hearts", "Maus", "roto", "Saga"]
+    );
+
+    let bleeding = &colecciones[1];
+    assert_eq!(bleeding.numeros, ["1", "2"]);
+    assert_eq!(bleeding.anio, Some(2026));
+    assert_eq!(bleeding.comics, 2);
+    // En orden de lectura, no de texto.
+    assert_eq!(colecciones[4].numeros, ["2", "10"]);
+}
+
+#[test]
+fn los_vinculos_se_guardan_cambian_y_se_quitan() {
+    let p = preparar();
+    assert!(p.biblioteca.vinculos().unwrap().is_empty());
+
+    let mut vinculo = Vinculo {
+        clave: "saga".to_string(),
+        externa: Some(SerieExterna {
+            fuente: "metron".to_string(),
+            id: "7".to_string(),
+            nombre: "Saga (2012)".to_string(),
+        }),
+        estado: EstadoVinculo::Automatico,
+        buscada: 100,
+    };
+    p.biblioteca.guardar_vinculo(&vinculo).unwrap();
+    assert_eq!(p.biblioteca.vinculos().unwrap()["saga"], vinculo);
+
+    // El usuario dice que no se busque: se sustituye.
+    vinculo.externa = None;
+    vinculo.estado = EstadoVinculo::Ignorado;
+    p.biblioteca.guardar_vinculo(&vinculo).unwrap();
+    let vinculos = p.biblioteca.vinculos().unwrap();
+    assert_eq!(vinculos.len(), 1);
+    assert_eq!(vinculos["saga"], vinculo);
+
+    p.biblioteca.quitar_vinculo("saga").unwrap();
+    assert!(p.biblioteca.vinculos().unwrap().is_empty());
+}
+
+#[test]
+fn una_serie_se_puede_renombrar_y_volver_al_nombre_automatico() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+
+    p.biblioteca
+        .renombrar_serie("saga", "Vinland Saga")
+        .unwrap();
+    let series = p.biblioteca.series().unwrap();
+    let saga = series.iter().find(|s| s.clave == "saga").unwrap();
+    assert_eq!(saga.nombre, "Vinland Saga");
+    // Sigue valiendo para pedir sus cómics, aunque el nombre ya no diga "Saga".
+    assert_eq!(p.biblioteca.comics_de_serie("saga").unwrap().len(), 2);
+
+    // Vacío: vuelve al nombre automático.
+    p.biblioteca.renombrar_serie("saga", "").unwrap();
+    let series = p.biblioteca.series().unwrap();
+    let saga = series.iter().find(|s| s.clave == "saga").unwrap();
+    assert_eq!(saga.nombre, "Saga");
+}
+
+#[test]
+fn un_comic_se_puede_renombrar_y_volver_al_nombre_automatico() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let comics = p.biblioteca.comics_de_serie("saga").unwrap();
+    let huella = &comics[0].huella;
+    assert_eq!(comics[0].nombre_personalizado, None);
+
+    p.biblioteca
+        .renombrar_comic(huella, "Un título mejor")
+        .unwrap();
+    let comics = p.biblioteca.comics_de_serie("saga").unwrap();
+    assert_eq!(
+        comics[0].nombre_personalizado.as_deref(),
+        Some("Un título mejor")
+    );
+
+    // El nombre se guarda por huella: sobrevive a mover el archivo (sin cambiar de
+    // carpeta, para no afectar a cómo se detecta la serie por el nombre).
+    fs::rename(
+        p.comics.join("Saga/Capítulo 2.cbz"),
+        p.comics.join("Saga/Capítulo 02.cbz"),
+    )
+    .unwrap();
+    escanear(&mut p.biblioteca);
+    let comics = p.biblioteca.comics_de_serie("saga").unwrap();
+
+    let movido = comics.iter().find(|f| &f.huella == huella).unwrap();
+    assert_eq!(
+        movido.nombre_personalizado.as_deref(),
+        Some("Un título mejor")
+    );
+
+    p.biblioteca.renombrar_comic(huella, "").unwrap();
+    let comics = p.biblioteca.comics_de_serie("saga").unwrap();
+    let movido = comics.iter().find(|f| &f.huella == huella).unwrap();
+    assert_eq!(movido.nombre_personalizado, None);
+}
+
+#[test]
+fn un_comic_eliminado_no_vuelve_a_aparecer_solo() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    assert_eq!(p.biblioteca.comics_de_serie("saga").unwrap().len(), 2);
+    let huella = p.biblioteca.comics_de_serie("saga").unwrap()[0]
+        .huella
+        .clone();
+
+    p.biblioteca.quitar_comic(&huella).unwrap();
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+    assert_eq!(saga.len(), 1);
+    assert!(saga.iter().all(|f| f.huella != huella));
+
+    // Un escaneo normal no lo vuelve a traer, aunque el archivo siga ahí.
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+    assert_eq!(saga.len(), 1);
+    assert!(saga.iter().all(|f| f.huella != huella));
+}
+
+#[test]
+fn la_portada_elegida_gana_y_se_puede_quitar() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+    let primero = saga[0].huella.clone();
+    assert_eq!(saga[0].portada().pagina, 0);
+
+    p.biblioteca.elegir_portada(&primero, Some(1)).unwrap();
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+    assert_eq!(saga[0].portada().pagina, 1);
+    assert_eq!(saga[1].portada().pagina, 0);
+    // La serie se enseña con la portada de su primer cómic.
+    let serie = p
+        .biblioteca
+        .series()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.clave == "saga")
+        .unwrap();
+    assert_eq!(serie.portada.pagina, 1);
+
+    // Sobrevive a un nuevo escaneo y se puede cambiar y quitar.
+    escanear(&mut p.biblioteca);
+    p.biblioteca.elegir_portada(&primero, Some(0)).unwrap();
+    assert_eq!(
+        p.biblioteca.comics_de_serie("saga").unwrap()[0]
+            .portada()
+            .pagina,
+        0
+    );
+    p.biblioteca.elegir_portada(&primero, Some(1)).unwrap();
+    p.biblioteca.elegir_portada(&primero, None).unwrap();
+    assert_eq!(
+        p.biblioteca.comics_de_serie("saga").unwrap()[0]
+            .portada()
+            .pagina,
+        0
+    );
+}
+
+#[test]
+fn la_portada_de_una_serie_puede_ser_la_de_cualquiera_de_sus_comics() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+    let portada_de_saga = |p: &Prueba| {
+        let series = p.biblioteca.series().unwrap();
+        series
+            .into_iter()
+            .find(|s| s.clave == "saga")
+            .unwrap()
+            .portada
+    };
+    // Por defecto, la del primero.
+    assert_eq!(portada_de_saga(&p).huella, saga[0].huella);
+
+    p.biblioteca
+        .elegir_portada_de_serie("saga", Some(&saga[1].huella))
+        .unwrap();
+    assert_eq!(portada_de_saga(&p).huella, saga[1].huella);
+
+    // Y con la página que se haya elegido para ese cómic.
+    p.biblioteca
+        .elegir_portada(&saga[1].huella, Some(2))
+        .unwrap();
+    assert_eq!(portada_de_saga(&p).pagina, 2);
+
+    // Un cómic que ya no está en la serie no deja la serie sin portada.
+    p.biblioteca
+        .elegir_portada_de_serie("saga", Some("otra-huella"))
+        .unwrap();
+    assert_eq!(portada_de_saga(&p).huella, saga[0].huella);
+
+    p.biblioteca
+        .elegir_portada_de_serie("saga", Some(&saga[1].huella))
+        .unwrap();
+    p.biblioteca.elegir_portada_de_serie("saga", None).unwrap();
+    assert_eq!(portada_de_saga(&p).huella, saga[0].huella);
+}
+
+#[test]
+fn el_siguiente_comic_es_el_que_toca_leer_despues_en_su_serie() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let saga = p.biblioteca.comics_de_serie("saga").unwrap();
+
+    let despues = p.biblioteca.siguiente_de(&saga[0].huella).unwrap();
+    assert_eq!(despues.map(|f| f.huella), Some(saga[1].huella.clone()));
+    // El último de la serie no tiene siguiente, ni un cómic que no está en la biblioteca.
+    assert!(p
+        .biblioteca
+        .siguiente_de(&saga[1].huella)
+        .unwrap()
+        .is_none());
+    assert!(p.biblioteca.siguiente_de("no-existe").unwrap().is_none());
+}
+
+#[test]
+fn los_favoritos_se_guardan_ponen_al_dia_y_quitan() {
+    let p = preparar();
+    let favorito = |clave: &str, titulo: &str, anadido| Favorito {
+        clave: clave.to_string(),
+        titulo: titulo.to_string(),
+        portada: Some(format!("https://ejemplo/{clave}.jpg")),
+        linea: "Manga, Japón".to_string(),
+        anadido,
+    };
+    assert!(p.biblioteca.favoritos().unwrap().is_empty());
+
+    p.biblioteca
+        .anadir_favorito(&favorito("anilist:1", "Uno", 100))
+        .unwrap();
+    p.biblioteca
+        .anadir_favorito(&favorito("anilist:2", "Dos", 200))
+        .unwrap();
+    let claves: Vec<String> = p
+        .biblioteca
+        .favoritos()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.clave)
+        .collect();
+    assert_eq!(claves, ["anilist:2", "anilist:1"], "los más nuevos primero");
+
+    // Guardarlo otra vez pone al día lo que se enseña, pero no cuándo se añadió.
+    p.biblioteca
+        .anadir_favorito(&favorito("anilist:1", "Uno bis", 999))
+        .unwrap();
+    let uno = p
+        .biblioteca
+        .favoritos()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.clave == "anilist:1")
+        .unwrap();
+    assert_eq!((uno.titulo.as_str(), uno.anadido), ("Uno bis", 100));
+
+    p.biblioteca.quitar_favorito("anilist:2").unwrap();
+    let claves: Vec<String> = p
+        .biblioteca
+        .favoritos()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.clave)
+        .collect();
+    assert_eq!(claves, ["anilist:1"]);
+}
+
+#[test]
+fn una_carpeta_propia_guarda_comics_sueltos() {
+    let temporal = TempDir::new().unwrap();
+    let sueltos = temporal.path().join("descargas");
+    crear_cbz(&sueltos.join("Maus.cbz"), 2, None);
+    crear_cbz(&sueltos.join("Akira.cbz"), 3, None);
+    escribir(&sueltos.join("notas.txt"));
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    let carpeta = biblioteca.crear_carpeta_propia("  Sueltos ").unwrap();
+    assert!(carpeta.propia);
+    assert_eq!(carpeta.ruta, PathBuf::from("Sueltos"));
+    // Vacía, sin nada que escanear.
+    assert_eq!(escanear(&mut biblioteca), Resumen::default());
+    assert!(biblioteca.crear_carpeta_propia("sueltos").is_err());
+    assert!(biblioteca.crear_carpeta_propia("   ").is_err());
+
+    // Los que no son cómics se saltan, y uno no entra dos veces.
+    let archivos = [
+        sueltos.join("Maus.cbz"),
+        sueltos.join("Akira.cbz"),
+        sueltos.join("notas.txt"),
+        sueltos.join("Maus.cbz"),
+    ];
+    assert_eq!(
+        biblioteca.anadir_archivos(carpeta.id, &archivos).unwrap(),
+        2
+    );
+    assert_eq!(escanear(&mut biblioteca).nuevos, 2);
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [("Akira".to_string(), 1), ("Maus".to_string(), 1)]
+    );
+    let carpetas = biblioteca.carpetas().unwrap();
+    assert_eq!(carpetas.len(), 1);
+    assert_eq!(carpetas[0].comics, 2);
+
+    // Escanear otra vez no cambia nada ni borra lo que no esté en una carpeta del disco.
+    let resumen = escanear(&mut biblioteca);
+    assert_eq!(
+        (resumen.nuevos, resumen.sin_cambios, resumen.borrados),
+        (0, 2, 0)
+    );
+
+    // Quitar uno lo saca de la carpeta y se puede volver a añadir.
+    let huella = biblioteca.comics_de_serie("Maus").unwrap().remove(0).huella;
+    biblioteca.quitar_comic(&huella).unwrap();
+    assert_eq!(
+        escanear(&mut biblioteca),
+        Resumen {
+            sin_cambios: 1,
+            ..Resumen::default()
+        }
+    );
+    assert_eq!(
+        biblioteca
+            .anadir_archivos(carpeta.id, &[sueltos.join("Maus.cbz")])
+            .unwrap(),
+        1
+    );
+    assert_eq!(escanear(&mut biblioteca).nuevos, 1);
+
+    // Una carpeta del disco no admite cómics sueltos, y quitar la propia se lleva los suyos.
+    let del_disco = biblioteca
+        .agregar_carpeta(temporal.path().join("descargas"))
+        .unwrap();
+    assert!(biblioteca
+        .anadir_archivos(del_disco.id, &[sueltos.join("Maus.cbz")])
+        .is_err());
+    biblioteca.quitar_carpeta(del_disco.id).unwrap();
+    biblioteca.quitar_carpeta(carpeta.id).unwrap();
+    assert!(biblioteca.series().unwrap().is_empty());
+}
+
+#[test]
+fn se_pueden_meter_comics_y_carpetas_en_una_serie() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+    let fuera = p._temporal.path().join("fuera");
+    crear_cbz(&fuera.join("Cualquier cosa.cbz"), 5, None);
+    crear_cbz(&fuera.join("lote/Tomo A.cbz"), 6, None);
+    crear_cbz(&fuera.join("lote/dentro/Tomo B.cbz"), 7, None);
+    escribir(&fuera.join("lote/notas.txt"));
+    fs::create_dir_all(fuera.join("imagenes")).unwrap();
+    fs::write(fuera.join("imagenes/1.jpg"), "a").unwrap();
+    fs::write(fuera.join("imagenes/2.jpg"), "b").unwrap();
+
+    let rutas = [
+        fuera.join("Cualquier cosa.cbz"),
+        fuera.join("lote"),
+        fuera.join("imagenes"),
+        // Uno que ya estaba en la biblioteca, en otra serie.
+        p.comics.join("Fondos/Maus.cbz"),
+        fuera.join("Cualquier cosa.cbz"),
+    ];
+    assert_eq!(p.biblioteca.anadir_a_serie("saga", &rutas).unwrap(), 5);
+    assert!(p.biblioteca.anadir_a_serie("no existe", &rutas).is_err());
+    // La carpeta oculta de los cómics sueltos no se ve.
+    assert_eq!(p.biblioteca.carpetas().unwrap().len(), 1);
+
+    let resumen = escanear(&mut p.biblioteca);
+    assert_eq!(resumen.nuevos, 4);
+    assert_eq!(
+        nombres_de_series(&p.biblioteca),
+        [
+            ("Akira".to_string(), 1),
+            ("Bleeding Hearts".to_string(), 2),
+            ("roto".to_string(), 1),
+            ("Saga".to_string(), 7),
+        ]
+    );
+    assert_eq!(p.biblioteca.carpetas().unwrap().len(), 1);
+
+    // Escanear otra vez lo deja igual, y volver a añadir lo mismo no cambia nada.
+    let resumen = escanear(&mut p.biblioteca);
+    assert_eq!((resumen.nuevos, resumen.borrados), (0, 0));
+    assert_eq!(p.biblioteca.anadir_a_serie("saga", &rutas).unwrap(), 0);
+    assert_eq!(p.biblioteca.comics_de_serie("saga").unwrap().len(), 7);
+
+    // Un cómic metido a mano se quita como cualquier otro, y no vuelve solo.
+    let huella = p
+        .biblioteca
+        .comics_de_serie("saga")
+        .unwrap()
+        .into_iter()
+        .find(|f| f.ruta.ends_with("Cualquier cosa.cbz"))
+        .unwrap()
+        .huella;
+    p.biblioteca.quitar_comic(&huella).unwrap();
+    escanear(&mut p.biblioteca);
+    assert_eq!(p.biblioteca.comics_de_serie("saga").unwrap().len(), 6);
+}
+
+#[test]
+fn un_subtitulo_tras_el_nombre_no_parte_la_serie() {
+    // Las Crónicas de Wormwood: sin número ni tomo, el nombre entero salía como serie.
+    let temporal = TempDir::new().unwrap();
+    let comics = temporal.path().join("comics");
+    crear_cbz(&comics.join("Las Crónicas de Wormwood.cbz"), 2, None);
+    crear_cbz(
+        &comics.join("Las Crónicas de Wormwood - El Último Enemigo.cbz"),
+        2,
+        None,
+    );
+    crear_cbz(
+        &comics.join("Las Crónicas de Wormwood - La Última Batalla.cbz"),
+        2,
+        None,
+    );
+    // Otra serie de la misma carpeta, que no tiene que mezclarse.
+    crear_cbz(&comics.join("Batman Beyond 001.cbz"), 2, None);
+    // Y otra carpeta con un nombre parecido, que tampoco.
+    crear_cbz(&comics.join("Otra/Las Crónicas de Wormwood - Aparte.cbz"), 2, None);
+
+    let mut biblioteca = Biblioteca::abrir(temporal.path().join("biblioteca.db")).unwrap();
+    biblioteca.agregar_carpeta(&comics).unwrap();
+    escanear(&mut biblioteca);
+    // Una segunda pasada no cambia nada.
+    escanear(&mut biblioteca);
+
+    assert_eq!(
+        nombres_de_series(&biblioteca),
+        [
+            ("Batman Beyond".to_string(), 1),
+            ("Las Crónicas de Wormwood".to_string(), 3),
+            ("Las Crónicas de Wormwood - Aparte".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn los_comics_se_pueden_ordenar_a_mano_dentro_de_la_serie() {
+    let mut p = preparar();
+    escanear(&mut p.biblioteca);
+
+    let huellas = |p: &Prueba| -> Vec<String> {
+        p.biblioteca
+            .comics_de_serie("saga")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.huella)
+            .collect()
+    };
+    let original = huellas(&p);
+    assert_eq!(original.len(), 2);
+    assert!(!p.biblioteca.tiene_orden_manual("saga").unwrap());
+
+    // El segundo pasa al principio.
+    p.biblioteca
+        .mover_comic("saga", &original[1], Movimiento::Principio)
+        .unwrap();
+    assert_eq!(huellas(&p), [original[1].clone(), original[0].clone()]);
+    assert!(p.biblioteca.tiene_orden_manual("saga").unwrap());
+
+    // El orden aguanta un reescaneo y manda sobre quién es el primero de la serie.
+    escanear(&mut p.biblioteca);
+    assert_eq!(huellas(&p), [original[1].clone(), original[0].clone()]);
+    let serie = p
+        .biblioteca
+        .series()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.nombre == "Saga")
+        .unwrap();
+    assert_eq!(serie.portada.huella, original[1]);
+
+    // Un cómic que llega después va al final.
+    crear_cbz(&p.comics.join("Saga/Capítulo 1.cbz"), 5, None);
+    escanear(&mut p.biblioteca);
+    let ahora = huellas(&p);
+    assert_eq!(ahora.len(), 3);
+    assert_eq!(ahora[..2], [original[1].clone(), original[0].clone()]);
+
+    // Mover el último "después" no hace nada; "antes" lo sube un sitio.
+    p.biblioteca
+        .mover_comic("saga", &ahora[2], Movimiento::Despues)
+        .unwrap();
+    assert_eq!(huellas(&p), ahora);
+    p.biblioteca
+        .mover_comic("saga", &ahora[2], Movimiento::Antes)
+        .unwrap();
+    assert_eq!(
+        huellas(&p),
+        [ahora[0].clone(), ahora[2].clone(), ahora[1].clone()]
+    );
+
+    // Restablecer vuelve al orden de lectura (1, 2, 10).
+    p.biblioteca.restablecer_orden("saga").unwrap();
+    assert!(!p.biblioteca.tiene_orden_manual("saga").unwrap());
+    let numeros: Vec<_> = p
+        .biblioteca
+        .comics_de_serie("saga")
+        .unwrap()
+        .iter()
+        .map(|f| f.metadatos.numero.clone())
+        .collect();
+    assert_eq!(
+        numeros,
+        [Some("1".to_string()), Some("2".to_string()), Some("10".to_string())]
+    );
+}
+
+#[test]
+fn soltar_un_comic_sobre_otro_ocupa_su_sitio() {
+    let mut p = preparar();
+    crear_cbz(&p.comics.join("Saga/Capítulo 1.cbz"), 5, None);
+    escanear(&mut p.biblioteca);
+
+    let huellas = |p: &Prueba| -> Vec<String> {
+        p.biblioteca
+            .comics_de_serie("saga")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.huella)
+            .collect()
+    };
+    let [a, b, c] = <[String; 3]>::try_from(huellas(&p)).unwrap();
+
+    // Hacia abajo: el primero ocupa el sitio del último.
+    p.biblioteca.colocar_en_lugar_de("saga", &a, &c).unwrap();
+    assert_eq!(huellas(&p), [b.clone(), c.clone(), a.clone()]);
+
+    // Hacia arriba: el último ocupa el sitio del primero.
+    p.biblioteca.colocar_en_lugar_de("saga", &a, &b).unwrap();
+    assert_eq!(huellas(&p), [a.clone(), b.clone(), c.clone()]);
+
+    // Sobre sí mismo o sobre algo que no está: no cambia nada.
+    p.biblioteca.restablecer_orden("saga").unwrap();
+    p.biblioteca.colocar_en_lugar_de("saga", &a, &a).unwrap();
+    p.biblioteca.colocar_en_lugar_de("saga", &a, "no existe").unwrap();
+    assert!(!p.biblioteca.tiene_orden_manual("saga").unwrap());
 }

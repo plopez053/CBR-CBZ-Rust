@@ -7,6 +7,11 @@ edition.workspace = true
 comic-biblioteca = { path = "../comic-biblioteca" }
 comic-core = { path = "../comic-core" }
 comic-imagen = { path = "../comic-imagen" }
+comic-novedades = { path = "../comic-novedades" }
+comic-vinetas = { path = "../comic-vinetas" }
 directories = "6.0.0"
 eframe = "0.36.2"
 rfd = "0.17.2"
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.34"
